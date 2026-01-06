@@ -27,3 +27,4 @@ Thumbs.db
 
 # TypeScript cache
 *.tsbuildinfo
+.vite

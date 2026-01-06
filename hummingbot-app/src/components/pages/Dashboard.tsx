@@ -7,7 +7,7 @@ import { formatNumber, formatCurrency, formatDuration } from "@/lib/utils";
 import { Activity, DollarSign, TrendingUp, Clock, RefreshCw } from "lucide-react";
 
 export function Dashboard() {
-  const { isConnected, strategyStatus, connectors, refreshStrategyStatus } = useApp();
+  const { isConnected, strategyStatus, connectors } = useApp();
   const [orders, setOrders] = useState<OrderInfo[]>([]);
   const [positions, setPositions] = useState<PositionInfo[]>([]);
   const [loading, setLoading] = useState(false);
