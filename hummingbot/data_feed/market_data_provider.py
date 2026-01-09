@@ -334,6 +334,66 @@ class MarketDataProvider:
         connector = self.get_connector_with_fallback(connector_name)
         return connector.get_order_book(trading_pair)
 
+    async def initialize_order_book(self, connector_name: str, trading_pair: str) -> bool:
+        """
+        Dynamically initializes order book for a trading pair on the specified connector.
+        This subscribes to the order book WebSocket channel and starts tracking the pair.
+
+        :param connector_name: str
+        :param trading_pair: str
+        :return: True if successful, False otherwise
+        """
+        connector = self.get_connector_with_fallback(connector_name)
+        if not hasattr(connector, 'order_book_tracker'):
+            self.logger().warning(f"Connector {connector_name} does not have order_book_tracker")
+            return False
+        return await connector.order_book_tracker.add_trading_pair(trading_pair)
+
+    async def initialize_order_books(self, connector_name: str, trading_pairs: List[str]) -> Dict[str, bool]:
+        """
+        Dynamically initializes order books for multiple trading pairs in parallel.
+
+        :param connector_name: str
+        :param trading_pairs: List[str]
+        :return: Dict mapping trading pair to success status
+        """
+        tasks = [self.initialize_order_book(connector_name, tp) for tp in trading_pairs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return {
+            tp: (result is True) if not isinstance(result, Exception) else False
+            for tp, result in zip(trading_pairs, results)
+        }
+
+    async def remove_order_book(self, connector_name: str, trading_pair: str) -> bool:
+        """
+        Removes order book tracking for a trading pair from the specified connector.
+        This unsubscribes from the WebSocket channel and stops tracking the pair.
+
+        :param connector_name: str
+        :param trading_pair: str
+        :return: True if successful, False otherwise
+        """
+        connector = self.get_connector_with_fallback(connector_name)
+        if not hasattr(connector, 'order_book_tracker'):
+            self.logger().warning(f"Connector {connector_name} does not have order_book_tracker")
+            return False
+        return await connector.order_book_tracker.remove_trading_pair(trading_pair)
+
+    async def remove_order_books(self, connector_name: str, trading_pairs: List[str]) -> Dict[str, bool]:
+        """
+        Removes order book tracking for multiple trading pairs in parallel.
+
+        :param connector_name: str
+        :param trading_pairs: List[str]
+        :return: Dict mapping trading pair to success status
+        """
+        tasks = [self.remove_order_book(connector_name, tp) for tp in trading_pairs]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return {
+            tp: (result is True) if not isinstance(result, Exception) else False
+            for tp, result in zip(trading_pairs, results)
+        }
+
     def get_price_by_type(self, connector_name: str, trading_pair: str, price_type: PriceType = PriceType.MidPrice):
         """
         Retrieves the price for a trading pair from the specified connector.
