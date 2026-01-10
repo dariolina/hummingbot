@@ -341,3 +341,25 @@ class BybitPerpetualAPIOrderBookDataSource(PerpetualAPIOrderBookDataSource):
 
     async def _subscribe_channels(self, ws: WSAssistant):
         pass  # unused
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamic subscription not supported for Bybit Perpetual due to separate
+        linear/non-linear WebSocket connections architecture.
+        """
+        self.logger().warning(
+            f"Dynamic subscription not supported for BybitPerpetualAPIOrderBookDataSource. "
+            f"Cannot subscribe to {trading_pair} at runtime."
+        )
+        return False
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamic unsubscription not supported for Bybit Perpetual due to separate
+        linear/non-linear WebSocket connections architecture.
+        """
+        self.logger().warning(
+            f"Dynamic unsubscription not supported for BybitPerpetualAPIOrderBookDataSource. "
+            f"Cannot unsubscribe from {trading_pair} at runtime."
+        )
+        return False
