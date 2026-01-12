@@ -6,10 +6,8 @@ This module tests:
 - add_trading_pair: Adds a trading pair to the internal list
 - remove_trading_pair: Removes a trading pair from the internal list
 """
-import asyncio
 import unittest
 from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock
 
 from hummingbot.core.data_type.order_book import OrderBook
 from hummingbot.core.data_type.order_book_message import OrderBookMessage
