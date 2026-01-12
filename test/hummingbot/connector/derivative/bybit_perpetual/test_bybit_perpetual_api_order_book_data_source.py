@@ -695,3 +695,33 @@ class BybitPerpetualAPIOrderBookDataSourceTests(IsolatedAsyncioWrapperTestCase):
         self.assertEqual(Decimal(str(general_info_result["markPrice"])), funding_info.mark_price)
         expected_utc_timestamp = int(general_info_result["nextFundingTime"]) // 1e3
         self.assertEqual(expected_utc_timestamp, funding_info.next_funding_utc_timestamp)
+
+    # Dynamic subscription tests - Bybit Perpetual does not support dynamic subscription
+
+    async def test_subscribe_to_trading_pair_not_supported(self):
+        """Test that subscribe_to_trading_pair returns False and logs warning."""
+        new_pair = "ETH-USDT"
+
+        result = await self.data_source.subscribe_to_trading_pair(new_pair)
+
+        self.assertFalse(result)
+        self.assertTrue(
+            self._is_logged(
+                "WARNING",
+                f"Dynamic subscription not supported for BybitPerpetualAPIOrderBookDataSource. "
+                f"Cannot subscribe to {new_pair} at runtime."
+            )
+        )
+
+    async def test_unsubscribe_from_trading_pair_not_supported(self):
+        """Test that unsubscribe_from_trading_pair returns False and logs warning."""
+        result = await self.data_source.unsubscribe_from_trading_pair(self.trading_pair)
+
+        self.assertFalse(result)
+        self.assertTrue(
+            self._is_logged(
+                "WARNING",
+                f"Dynamic unsubscription not supported for BybitPerpetualAPIOrderBookDataSource. "
+                f"Cannot unsubscribe from {self.trading_pair} at runtime."
+            )
+        )
