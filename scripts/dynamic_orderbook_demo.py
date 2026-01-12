@@ -1,8 +1,6 @@
 import asyncio
 from typing import Dict, List
 
-import pandas as pd
-
 from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.exchange.paper_trade.trading_pair import TradingPair
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
