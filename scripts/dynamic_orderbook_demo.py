@@ -83,9 +83,12 @@ class DynamicOrderbookDemo(ScriptStrategyBase):
 
         # Timeline status
         lines.append("\n  Timeline:")
-        lines.append(f"    [{'✓' if self._sol_added else '○'}] 10s - Add SOL-USDT" + (" (added)" if self._sol_added else ""))
-        lines.append(f"    [{'✓' if self._eth_added else '○'}] 15s - Add ETH-USDT" + (" (added)" if self._eth_added else ""))
-        lines.append(f"    [{'✓' if self._sol_removed else '○'}] 25s - Remove SOL-USDT & ETH-USDT" + (" (removed)" if self._sol_removed else ""))
+        lines.append(
+            f"    [{'✓' if self._sol_added else '○'}] 10s - Add SOL-USDT" + (" (added)" if self._sol_added else ""))
+        lines.append(
+            f"    [{'✓' if self._eth_added else '○'}] 15s - Add ETH-USDT" + (" (added)" if self._eth_added else ""))
+        lines.append(f"    [{'✓' if self._sol_removed else '○'}] 25s - Remove SOL-USDT & ETH-USDT" + (
+            " (removed)" if self._sol_removed else ""))
 
         # Get tracked pairs from order book tracker
         tracker = connector.order_book_tracker
@@ -133,7 +136,7 @@ class DynamicOrderbookDemo(ScriptStrategyBase):
 
             # Order book table
             lines.append(f"  {'Bid Size':>12} {'Bid Price':>14} │ {'Ask Price':<14} {'Ask Size':<12}")
-            lines.append(f"  {'-'*12} {'-'*14} │ {'-'*14} {'-'*12}")
+            lines.append(f"  {'-' * 12} {'-' * 14} │ {'-' * 14} {'-' * 12}")
 
             for i in range(depth):
                 bid_price = float(bids_df.iloc[i].price)
@@ -145,7 +148,7 @@ class DynamicOrderbookDemo(ScriptStrategyBase):
             # Total volume at displayed levels
             total_bid_vol = float(bids_df.iloc[:depth]['amount'].sum())
             total_ask_vol = float(asks_df.iloc[:depth]['amount'].sum())
-            lines.append(f"  {'-'*12} {'-'*14} │ {'-'*14} {'-'*12}")
+            lines.append(f"  {'-' * 12} {'-' * 14} │ {'-' * 14} {'-' * 12}")
             lines.append(f"  {'Total:':>12} {total_bid_vol:>14.4f} │ {total_ask_vol:<14.4f}")
 
             # Add horizontal depth chart below
