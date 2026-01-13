@@ -37,6 +37,8 @@ class PerpsSignalStrategyConfig(BaseClientModel):
     take_profit_order_type: OrderType = Field(default=OrderType.MARKET)
     stop_loss_order_type: OrderType = Field(default=OrderType.MARKET)
     time_limit_order_type: OrderType = Field(default=OrderType.MARKET)
+    trailing_stop_activation_delta: float = Field(default=0.003, gt=0, description="Trailing stop activation threshold (e.g., 0.003 = 0.3%). Position must reach this PNL% before trailing stop activates.")
+    trailing_stop_trailing_delta: float = Field(default=0.001, gt=0, description="Trailing stop delta (e.g., 0.001 = 0.1%). Once activated, stop loss trails by this amount.")
     
     # Technical indicator confirmation parameters
     rsi_length: int = Field(default=14, gt=0, description="RSI period length")
@@ -107,6 +109,8 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         self.take_profit_order_type = config.take_profit_order_type
         self.stop_loss_order_type = config.stop_loss_order_type
         self.time_limit_order_type = config.time_limit_order_type
+        self.trailing_stop_activation_delta = config.trailing_stop_activation_delta
+        self.trailing_stop_trailing_delta = config.trailing_stop_trailing_delta
         
         # Technical indicator confirmation parameters
         self.rsi_length = config.rsi_length
