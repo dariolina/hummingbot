@@ -751,7 +751,8 @@ class PositionExecutor(ExecutorBase):
                 price_bar.append(f"TP:{take_profit_price:.5f}")
                 lines.extend(["".join(price_bar)])
             if self.config.triple_barrier_config.trailing_stop:
-                lines.extend([f"Trailing stop pnl trigger: {self._trailing_stop_trigger_pct:.5f}"])
+                trigger_display = f"{self._trailing_stop_trigger_pct:.5f}" if self._trailing_stop_trigger_pct is not None else "Not activated"
+                lines.extend([f"Trailing stop pnl trigger: {trigger_display}"])
             lines.extend(["-----------------------------------------------------------------------------------------------------------"])
         return lines
 
