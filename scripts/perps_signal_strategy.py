@@ -14,7 +14,7 @@ from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.data_feed.candles_feed.candles_factory import CandlesFactory
 from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy.directional_strategy_base import DirectionalStrategyBase
-from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig, TripleBarrierConfig, TrailingStop
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.base import RunnableStatus
@@ -30,7 +30,8 @@ class PerpsSignalStrategyConfig(BaseClientModel):
     position_mode: PositionMode = Field(default="ONEWAY")
     leverage: int = Field(default=10, gt=0)
     margin_usd: Decimal = Field(default=Decimal("10"), gt=0, description="Margin amount in USD (position value = margin * leverage)")
-    stop_loss: float = Field(default=0.03, gt=0)
+    stop_loss: float = Field(default=0.03, gt=0, description="Static stop loss (used when stop_loss_natr_multiplier is 0)")
+    stop_loss_natr_multiplier: float = Field(default=0.0, ge=0, description="Dynamic stop loss = NATR * multiplier. Set to 0 to use static stop_loss.")
     take_profit: float = Field(default=0.01, gt=0)
     time_limit: int = Field(default=3600, gt=0)
     open_order_type: OrderType = Field(default=OrderType.MARKET)
@@ -108,6 +109,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         self.leverage = config.leverage
         self.margin_usd = config.margin_usd
         self.stop_loss = config.stop_loss
+        self.stop_loss_natr_multiplier = config.stop_loss_natr_multiplier
         self.take_profit = config.take_profit
         self.time_limit = config.time_limit
         self.open_order_type = config.open_order_type
@@ -161,6 +163,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         self._pending_market_id: Optional[str] = None  # Market ID for position being created
         self._last_api_response: Optional[Dict[str, Any]] = None
         self._current_signal: int = 0
+        self._current_natr: Optional[float] = None  # Current NATR for dynamic stop loss
         self._api_polling_task: Optional[asyncio.Task] = None
         self._http_client: Optional[aiohttp.ClientSession] = None
         
@@ -337,7 +340,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                 return False
             
             # Check profitability
-            pnl_pct = executor.trade_pnl_pct
+            pnl_pct = executor.get_net_pnl_pct()
             is_profitable = pnl_pct > Decimal("0")
             
             if is_profitable:
@@ -363,11 +366,20 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                 return True
             else:
                 # Not profitable: check if loss is small enough to keep open
-                small_loss_threshold = Decimal(str(self.small_loss_threshold))
+                # Use dynamic threshold (1x NATR) if available, else static config
+                if self._current_natr is not None:
+                    # NATR is percentage, convert to decimal and make negative for threshold
+                    dynamic_threshold = -(self._current_natr / 100)
+                    small_loss_threshold = Decimal(str(dynamic_threshold))
+                    threshold_source = f"1x NATR ({self._current_natr:.3f}%)"
+                else:
+                    small_loss_threshold = Decimal(str(self.small_loss_threshold))
+                    threshold_source = "static config"
+                
                 if pnl_pct > small_loss_threshold:
                     # Small loss: keep position open to allow recovery
                     self.logger().info(
-                        f"Executor {executor.config.id} has small loss ({pnl_pct:.4%} > {small_loss_threshold:.4%}). "
+                        f"Executor {executor.config.id} has small loss ({pnl_pct:.4%} > {small_loss_threshold:.4%} [{threshold_source}]). "
                         f"Keeping position open due to {reason} to allow recovery."
                     )
                     return True
@@ -741,8 +753,8 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     )
                     candles_df["BBP"] = float('nan')
                 
-                # Calculate NATR (Normalized ATR) for volatility filtering
-                if self.enable_volatility_filter:
+                # Calculate NATR (Normalized ATR) for volatility filtering and dynamic stop loss
+                if self.enable_volatility_filter or self.stop_loss_natr_multiplier > 0:
                     natr = ta.natr(
                         candles_df["high"],
                         candles_df["low"],
@@ -769,14 +781,19 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     rsi_falling = stoch_k < stoch_d
                     stoch_info = f"StochRSI K={stoch_k:.1f} D={stoch_d:.1f}"
                     
+                    # Get NATR for volatility filter and dynamic stop loss
+                    natr_value = last_candle.get("NATR", None) if "NATR" in candles_df.columns else None
+                    
                     # Volatility filter: Skip if volatility is too low (choppy market)
-                    if self.enable_volatility_filter and "NATR" in candles_df.columns:
-                        natr_value = last_candle["NATR"]
+                    if self.enable_volatility_filter and natr_value is not None:
                         if natr_value < self.min_volatility_pct:
                             self.logger().info(
                                 f"Skipping signal: NATR {natr_value:.3f}% < {self.min_volatility_pct}% (insufficient volatility, choppy market) RSI {rsi:.2f}, BBP {bbp:.3f}"
                             )
                             return None
+                    
+                    # Store NATR for dynamic stop loss calculation
+                    self._current_natr = natr_value
 
                     # Handle no-trade signal: use RSI override if enabled
                     if signal == 0:
@@ -912,6 +929,31 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             # Calculate base amount: amount = position_value / price
             amount = position_value_usd / price
             
+            # Calculate dynamic stop loss if NATR multiplier is configured
+            if self.stop_loss_natr_multiplier > 0 and self._current_natr is not None:
+                # NATR is in percentage (e.g., 0.2 = 0.2%), convert to decimal for stop loss
+                dynamic_stop_loss = (self._current_natr / 100) * self.stop_loss_natr_multiplier
+                self.logger().info(
+                    f"Dynamic stop loss: NATR {self._current_natr:.3f}% × {self.stop_loss_natr_multiplier} = {dynamic_stop_loss:.4f} "
+                    f"({dynamic_stop_loss*100:.2f}%, {dynamic_stop_loss*self.leverage*100:.1f}% margin at {self.leverage}x)"
+                )
+                # Create custom triple barrier config with dynamic stop loss
+                triple_barrier = TripleBarrierConfig(
+                    stop_loss=Decimal(str(dynamic_stop_loss)),
+                    take_profit=Decimal(str(self.take_profit)),
+                    time_limit=self.time_limit,
+                    trailing_stop=TrailingStop(
+                        activation_price=Decimal(str(self.trailing_stop_activation_delta)),
+                        trailing_delta=Decimal(str(self.trailing_stop_trailing_delta))),
+                    open_order_type=self.open_order_type,
+                    take_profit_order_type=self.take_profit_order_type,
+                    stop_loss_order_type=self.stop_loss_order_type,
+                    time_limit_order_type=self.time_limit_order_type
+                )
+            else:
+                # Use static triple barrier config
+                triple_barrier = self.triple_barrier_conf
+            
             position_config = PositionExecutorConfig(
                 timestamp=timestamp,
                 trading_pair=self.trading_pair,
@@ -919,7 +961,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                 side=side,
                 amount=amount,
                 entry_price=price,
-                triple_barrier_config=self.triple_barrier_conf,
+                triple_barrier_config=triple_barrier,
                 leverage=self.leverage,
             )
             return position_config
