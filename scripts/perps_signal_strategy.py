@@ -44,6 +44,11 @@ class PerpsSignalStrategyConfig(BaseClientModel):
     rsi_length: int = Field(default=14, gt=0, description="RSI period length")
     rsi_overbought: float = Field(default=70.0, ge=0, le=100, description="RSI overbought threshold (skip LONG if RSI > this)")
     rsi_oversold: float = Field(default=30.0, ge=0, le=100, description="RSI oversold threshold (skip SHORT if RSI < this)")
+    rsi_extreme_overbought: float = Field(default=85.0, ge=0, le=100, description="RSI extreme overbought threshold (skip LONG if RSI > this)")
+    rsi_extreme_oversold: float = Field(default=15.0, ge=0, le=100, description="RSI extreme oversold threshold (skip SHORT if RSI < this)")
+    stoch_rsi_length: int = Field(default=5, ge=2, description="Stochastic RSI lookback period")
+    stoch_rsi_k: int = Field(default=2, ge=2, description="Stochastic RSI %K smoothing period (min 2)")
+    stoch_rsi_d: int = Field(default=2, ge=2, description="Stochastic RSI %D smoothing period (min 2)")
     bb_length: int = Field(default=20, gt=0, description="Bollinger Bands period length")
     bb_std: float = Field(default=2.0, gt=0, description="Bollinger Bands standard deviation")
     bb_upper_threshold: float = Field(default=0.8, ge=0, le=1, description="BBP upper threshold (skip LONG if BBP > this)")
@@ -116,6 +121,11 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         self.rsi_length = config.rsi_length
         self.rsi_overbought = config.rsi_overbought
         self.rsi_oversold = config.rsi_oversold
+        self.rsi_extreme_overbought = config.rsi_extreme_overbought
+        self.rsi_extreme_oversold = config.rsi_extreme_oversold
+        self.stoch_rsi_length = config.stoch_rsi_length
+        self.stoch_rsi_k = config.stoch_rsi_k
+        self.stoch_rsi_d = config.stoch_rsi_d
         self.bb_length = config.bb_length
         self.bb_std = config.bb_std
         self.bb_upper_threshold = config.bb_upper_threshold
@@ -147,7 +157,8 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         # Initialize market_id tracking
         self._tracked_market_id: Optional[str] = None
         self._traded_market_ids: set = set()  # Track market_ids that have already been traded
-        self._executor_market_ids: Dict[str, str] = {}  # Map executor_id -> market_id
+        self._executor_market_ids: Dict[str, str] = {}  # Map executor_id -> market_id (or rsi_market_id)
+        self._pending_market_id: Optional[str] = None  # Market ID for position being created
         self._last_api_response: Optional[Dict[str, Any]] = None
         self._current_signal: int = 0
         self._api_polling_task: Optional[asyncio.Task] = None
@@ -426,11 +437,11 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                 reason = ""
                 
                 if executor.config.side == TradeType.BUY:  # LONG position
-                    if rsi > self.rsi_overbought+10.0:
+                    if rsi > self.rsi_overbought:
                         should_activate = True
                         reason = f"RSI {rsi:.2f} > {self.rsi_overbought} (overbought)"
                 elif executor.config.side == TradeType.SELL:  # SHORT position
-                    if rsi < self.rsi_oversold-10.0:
+                    if rsi < self.rsi_oversold:
                         should_activate = True
                         reason = f"RSI {rsi:.2f} < {self.rsi_oversold} (oversold)"
                 
@@ -467,7 +478,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             active_executor_ids = {executor.config.id for executor in self.active_executors}
             closed_executor_ids = set(self._executor_market_ids.keys()) - active_executor_ids
             for executor_id in closed_executor_ids:
-                del self._executor_market_ids[executor_id]
+                self._executor_market_ids.pop(executor_id, None)
             if self.is_perpetual:
                 self.check_and_set_leverage()
             
@@ -491,27 +502,36 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             if not active_executors:
                 self._tracked_market_id = None
             
-            # Check for market_id changes FIRST (before max_executors check)
-            # If new market_id detected, handle existing positions based on profitability
+            # On every tick: check if any active market_signal executors have a different market_id
+            # Keep profitable ones, close unprofitable ones
+            # Only affect market_signal executors, not rsi_override executors
             if market_id and active_executors:
-                if market_id != self._tracked_market_id:
-                    # New market_id detected: check profitability of existing positions
-                    self.logger().info(
-                        f"New market_id detected ({market_id} vs tracked {self._tracked_market_id}). Checking {len(active_executors)} active position(s)."
-                    )
-                    for executor in active_executors:
-                        self.handle_profitable_position(executor, "market_id change")
-                    # Update tracked market_id but don't return - allow new position to be created
-                    self._tracked_market_id = market_id
+                # Find market_signal executors with a different market_id than current
+                stale_market_executors = [
+                    executor for executor in active_executors
+                    if self._executor_market_ids.get(executor.config.id) != market_id
+                ]
+                for executor in stale_market_executors:
+                    exec_market_id = self._executor_market_ids.get(executor.config.id, "N/A")
+                    self.handle_profitable_position(executor, f"stale market_id ({exec_market_id} vs current {market_id})")
+                
+                # Update tracked market_id
+                self._tracked_market_id = market_id
                     
             # If signal is no-trade (0) and we have open positions, handle based on profitability
             # This check also needs to happen before max_executors check
+            # Only affect market_signal executors, not rsi_override executors
             if signal == 0 and active_executors:
-                self.logger().info(
-                    f"Signal changed to no-trade. Checking {len(active_executors)} active position(s)."
-                )
-                for executor in active_executors:
-                    self.handle_profitable_position(executor, "signal flip")
+                market_signal_executors = [
+                    executor for executor in active_executors
+                    if not self._executor_market_ids.get(executor.config.id, "").startswith("rsi_")
+                ]
+                if market_signal_executors:
+                    self.logger().info(
+                        f"Signal changed to no-trade. Checking {len(market_signal_executors)} market_signal position(s)."
+                    )
+                    for executor in market_signal_executors:
+                        self.handle_profitable_position(executor, "signal flip")
                 # Don't clear tracked market_id or return - allow new positions if RSI extremes allow it
             
             # Note: signal == 0 (no-trade) is handled in get_position_config() which checks RSI extremes
@@ -521,21 +541,59 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             if not (self.max_active_executors_condition and self.all_candles_ready and self.time_between_signals_condition):
                 return
             
-            # Market ID tracking: allow multiple executors for different market_ids
-            # Only prevent duplicate positions for the SAME market_id if we already have an active executor for it
-            if market_id:
+            # Market ID tracking: only apply to market_signal executors
+            # RSI override executors don't need market_id tracking and can re-enter freely
+            position_config = self.get_position_config()
+            if not position_config:
+                return
+            
+            executor_market_id = self._pending_market_id
+            is_rsi_override = executor_market_id and executor_market_id.startswith("rsi_")
+            
+            # Close unprofitable RSI executors when valid opposite-direction market signal arrives
+            # Only for market signals (signal 1 or -1), not no-trade (0)
+            if not is_rsi_override and signal != 0 and active_executors:
+                new_side = position_config.side
+                unprofitable_opposite_rsi = [
+                    executor for executor in active_executors
+                    if (self._executor_market_ids.get(executor.config.id, "").startswith("rsi_")
+                        and executor.config.side != new_side
+                        and executor.trade_pnl_pct <= Decimal("0"))
+                ]
+                for executor in unprofitable_opposite_rsi:
+                    self.logger().info(
+                        f"Closing unprofitable RSI {executor.config.side.name} executor {executor.config.id} "
+                        f"(PNL: {executor.trade_pnl_pct:.4%}) - valid {new_side.name} market signal received"
+                    )
+                    self.handle_profitable_position(executor, f"opposite market signal ({new_side.name})")
+            
+            # Prevent multiple RSI override executors - only allow one at a time
+            if is_rsi_override:
+                existing_rsi_executors = [
+                    executor for executor in active_executors
+                    if self._executor_market_ids.get(executor.config.id, "").startswith("rsi_")
+                ]
+                if existing_rsi_executors:
+                    self.logger().debug(
+                        f"Skipping RSI override - already have {len(existing_rsi_executors)} active RSI executor(s)"
+                    )
+                    return
+            
+            # Only apply market_id tracking to market_signal executors (not rsi_ prefixed)
+            if not is_rsi_override and executor_market_id:
                 # Check if we already have an active executor for this market_id
                 existing_executor_for_market = None
                 for executor in active_executors:
-                    executor_market_id = self._executor_market_ids.get(executor.config.id)
-                    if executor_market_id == market_id:
+                    exec_market_id = self._executor_market_ids.get(executor.config.id)
+                    # Only check non-rsi executors for duplicates
+                    if exec_market_id == executor_market_id and not exec_market_id.startswith("rsi_"):
                         existing_executor_for_market = executor
                         break
                 
                 if existing_executor_for_market:
                     # Same market_id with active executor - skip to prevent duplicate
                     self.logger().debug(
-                        f"Skipping market_id {market_id} - already have active executor {existing_executor_for_market.config.id}"
+                        f"Skipping market_id {executor_market_id} - already have active executor {existing_executor_for_market.config.id}"
                     )
                     return
                 
@@ -549,20 +607,21 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     "No active" in api_reason and "markets found" in api_reason
                 )
                 
-                if market_id in self._traded_market_ids and not allow_rsi_override_for_traded:
+                if executor_market_id in self._traded_market_ids and not allow_rsi_override_for_traded:
                     self.logger().debug(
-                        f"Skipping market_id {market_id} - already traded (signal may be flipping)"
+                        f"Skipping market_id {executor_market_id} - already traded (signal may be flipping)"
                     )
                     return
-                elif market_id in self._traded_market_ids and allow_rsi_override_for_traded:
+                elif executor_market_id in self._traded_market_ids and allow_rsi_override_for_traded:
                     self.logger().info(
-                        f"Allowing RSI override for already-traded market_id {market_id} "
+                        f"Allowing RSI override for already-traded market_id {executor_market_id} "
                         f"(reason: {api_reason})"
                     )
             
             # Check for profitable positions: only allow new executor in same direction
-            if active_executors and signal != 0:
-                new_side = TradeType.BUY if signal == 1 else TradeType.SELL
+            # Apply to ALL executors (both market_signal and rsi_override) to prevent conflicting directions
+            if active_executors and position_config:
+                new_side = position_config.side
                 profitable_executors = [
                     executor for executor in active_executors
                     if executor.trade_pnl_pct > Decimal("0")
@@ -571,29 +630,46 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     # Check if any profitable executor is in opposite direction
                     for executor in profitable_executors:
                         if executor.config.side != new_side:
+                            executor_type = "RSI override" if self._executor_market_ids.get(executor.config.id, "").startswith("rsi_") else "market_signal"
                             self.logger().info(
-                                f"Skipping {new_side.name} signal: existing profitable {executor.config.side.name} position "
+                                f"Skipping {new_side.name} position: existing profitable {executor.config.side.name} {executor_type} position "
                                 f"(executor {executor.config.id}, PNL: {executor.trade_pnl_pct:.4%})"
                             )
                             return
             
-            # Create position config
-            position_config = self.get_position_config()
-            if position_config:
-                signal_executor = PositionExecutor(
-                    strategy=self,
-                    config=position_config,
-                )
-                signal_executor.start()
-                self.active_executors.append(signal_executor)
-                # Update tracked market_id and mark as traded
-                if market_id:
-                    self._tracked_market_id = market_id
-                    self._traded_market_ids.add(market_id)
-                    self._executor_market_ids[signal_executor.config.id] = market_id
+            # Create executor
+            signal_executor = PositionExecutor(
+                strategy=self,
+                config=position_config,
+            )
+            signal_executor.start()
+            self.active_executors.append(signal_executor)
+            
+            # Store executor market_id (may be rsi_ prefixed)
+            if executor_market_id:
+                self._executor_market_ids[signal_executor.config.id] = executor_market_id
+                
+                # Update tracked market_id and mark as traded (only for regular market_signal executors)
+                if not is_rsi_override:
+                    self._tracked_market_id = executor_market_id
+                    self._traded_market_ids.add(executor_market_id)
                     self.logger().info(
-                        f"Created executor {signal_executor.config.id} for market_id {market_id} (total active: {len(self.active_executors)}, total traded: {len(self._traded_market_ids)})"
+                        f"Created market_signal executor {signal_executor.config.id} for market_id {executor_market_id} "
+                        f"(total active: {len(self.active_executors)}, total traded: {len(self._traded_market_ids)})"
                     )
+                else:
+                    self.logger().info(
+                        f"Created RSI override executor {signal_executor.config.id} for market_id {executor_market_id} "
+                        f"(total active: {len(self.active_executors)})"
+                    )
+            else:
+                self.logger().info(
+                    f"Created executor {signal_executor.config.id} "
+                    f"(total active: {len(self.active_executors)})"
+                )
+            
+            # Clear pending market_id after position creation
+            self._pending_market_id = None
         except Exception as e:
             self.logger().error(f"Error in on_tick: {e}", exc_info=True)
     
@@ -601,6 +677,8 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         """
         Override to create position config from API signal.
         """
+        # Reset pending market_id at start to prevent stale values
+        self._pending_market_id = None
         signal = self.get_signal()
         
         # Check if connector exists and is ready
@@ -631,6 +709,11 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                 # Calculate RSI
                 candles_df.ta.rsi(length=self.rsi_length, append=True)
                 rsi_column = f"RSI_{self.rsi_length}"
+                
+                # Calculate Stochastic RSI for momentum/direction detection
+                candles_df.ta.stochrsi(length=self.stoch_rsi_length, rsi_length=self.rsi_length, k=self.stoch_rsi_k, d=self.stoch_rsi_d, append=True)
+                stoch_k_column = f"STOCHRSIk_{self.stoch_rsi_length}_{self.rsi_length}_{self.stoch_rsi_k}_{self.stoch_rsi_d}"
+                stoch_d_column = f"STOCHRSId_{self.stoch_rsi_length}_{self.rsi_length}_{self.stoch_rsi_k}_{self.stoch_rsi_d}"
                 
                 # Calculate Bollinger Bands (using lower_std and upper_std like bollinger_v1.py)
                 candles_df.ta.bbands(length=self.bb_length, lower_std=self.bb_std, upper_std=self.bb_std, append=True)
@@ -678,34 +761,59 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     rsi = last_candle[rsi_column]
                     bbp = last_candle["BBP"]
                     
+                    # Get Stochastic RSI for momentum/direction detection
+                    # %K > %D = bullish momentum (RSI rising), %K < %D = bearish momentum (RSI falling)
+                    stoch_k = last_candle.get(stoch_k_column, 50)
+                    stoch_d = last_candle.get(stoch_d_column, 50)
+                    rsi_rising = stoch_k > stoch_d
+                    rsi_falling = stoch_k < stoch_d
+                    stoch_info = f"StochRSI K={stoch_k:.1f} D={stoch_d:.1f}"
+                    
                     # Volatility filter: Skip if volatility is too low (choppy market)
                     if self.enable_volatility_filter and "NATR" in candles_df.columns:
                         natr_value = last_candle["NATR"]
                         if natr_value < self.min_volatility_pct:
                             self.logger().info(
-                                f"Skipping signal: NATR {natr_value:.3f}% < {self.min_volatility_pct}% (insufficient volatility, choppy market)"
+                                f"Skipping signal: NATR {natr_value:.3f}% < {self.min_volatility_pct}% (insufficient volatility, choppy market) RSI {rsi:.2f}, BBP {bbp:.3f}"
                             )
                             return None
-                    
+
                     # Handle no-trade signal: use RSI override if enabled
                     if signal == 0:
                         if self.enable_rsi_override:
-                            # RSI < 30 (strongly oversold) + BBP at lower band → LONG
-                            if rsi < 30.0 and bbp < self.bb_lower_threshold:
+                            # RSI extremely oversold + BBP at lower band + RSI rising (bouncing) → LONG
+                            if rsi < self.rsi_extreme_oversold and bbp < self.bb_lower_threshold and rsi_rising:
                                 signal = 1
+                                # Use rsi_ prefixed market_id if available, otherwise generate one
+                                base_market_id = self._last_api_response.get('market_id') if self._last_api_response else None
+                                if base_market_id:
+                                    self._pending_market_id = f"rsi_{base_market_id}"
+                                else:
+                                    # Generate a unique ID if no market_id available
+                                    self._pending_market_id = f"rsi_{int(time.time())}"
                                 self.logger().info(
-                                    f"RSI override (no-trade): RSI {rsi:.2f} < 30 (strongly oversold) and BBP {bbp:.3f} < {self.bb_lower_threshold} (at lower band). Opening LONG."
+                                    f"RSI override (no-trade): RSI {rsi:.2f} < {self.rsi_extreme_oversold} (extremely oversold), "
+                                    f"{stoch_info} (rising), BBP {bbp:.3f} < {self.bb_lower_threshold}. Opening LONG."
                                 )
-                            # RSI > 70 (strongly overbought) + BBP at upper band → SHORT
-                            elif rsi > 70.0 and bbp > self.bb_upper_threshold:
+                            # RSI extremely overbought + BBP at upper band + RSI falling (reversing) → SHORT
+                            elif rsi > self.rsi_extreme_overbought and bbp > self.bb_upper_threshold and rsi_falling:
                                 signal = -1
+                                # Use rsi_ prefixed market_id if available, otherwise generate one
+                                base_market_id = self._last_api_response.get('market_id') if self._last_api_response else None
+                                if base_market_id:
+                                    self._pending_market_id = f"rsi_{base_market_id}"
+                                else:
+                                    # Generate a unique ID if no market_id available
+                                    self._pending_market_id = f"rsi_{int(time.time())}"
                                 self.logger().info(
-                                    f"RSI override (no-trade): RSI {rsi:.2f} > 70 (strongly overbought) and BBP {bbp:.3f} > {self.bb_upper_threshold} (at upper band). Opening SHORT."
+                                    f"RSI override (no-trade): RSI {rsi:.2f} > {self.rsi_extreme_overbought} (extremely overbought), "
+                                    f"{stoch_info} (falling), BBP {bbp:.3f} > {self.bb_upper_threshold}. Opening SHORT."
                                 )
                             else:
-                                # No-trade signal and RSI/BBP don't meet criteria
+                                # No-trade signal and RSI/BBP don't meet criteria (including direction)
+                                direction_info = "rising" if rsi_rising else "falling" if rsi_falling else "flat"
                                 self.logger().info(
-                                    f"Skipping no-trade signal: RSI {rsi:.2f}, BBP {bbp:.3f} - conditions not met for RSI-based entry"
+                                    f"Skipping no-trade signal: RSI {rsi:.2f}, {stoch_info} ({direction_info}), BBP {bbp:.3f} - conditions not met"
                                 )
                                 return None
                         else:
@@ -716,18 +824,34 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                             return None
                     
                     # Normal RSI filtering for API signals (1 or -1) - no override, just skip if unfavorable
+                    # Use regular market_id for market signals
+                    if self._pending_market_id is None:
+                        self._pending_market_id = self._last_api_response.get('market_id') if self._last_api_response else None
+                    
                     if signal == 1:
                         if rsi > self.rsi_overbought:
                             # Overbought: skip LONG
                             self.logger().info(
-                                f"Skipping LONG signal: RSI {rsi:.2f} > {self.rsi_overbought} (overbought)"
+                                f"Skipping LONG signal: RSI {rsi:.2f} > {self.rsi_overbought} (overbought), {stoch_info}"
+                            )
+                            return None
+                        if rsi_falling and rsi > self.rsi_oversold:
+                            # RSI momentum bearish: wait for stabilization before LONG
+                            self.logger().info(
+                                f"Skipping LONG signal: RSI {rsi:.2f}, {stoch_info} (falling) - waiting for stabilization"
                             )
                             return None
                     elif signal == -1:
                         if rsi < self.rsi_oversold:
                             # Oversold: skip SHORT
                             self.logger().info(
-                                f"Skipping SHORT signal: RSI {rsi:.2f} < {self.rsi_oversold} (oversold)"
+                                f"Skipping SHORT signal: RSI {rsi:.2f} < {self.rsi_oversold} (oversold), {stoch_info}"
+                            )
+                            return None
+                        if rsi_rising and rsi < self.rsi_overbought:
+                            # RSI momentum bullish: wait for stabilization before SHORT
+                            self.logger().info(
+                                f"Skipping SHORT signal: RSI {rsi:.2f}, {stoch_info} (rising) - waiting for stabilization"
                             )
                             return None
                     
@@ -753,7 +877,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     self.logger().debug(
                         f"Signal confirmed by indicators: RSI={rsi:.2f}, BBP={bbp:.3f}{volatility_info}"
                     )
-                    self.logger().info("Tech checks passed")
+                    self.logger().info(f"Tech checks passed: RSI={rsi:.2f}, BBP={bbp:.3f}{volatility_info}")
                 else:
                     # Indicators calculated but columns missing - skip position
                     bb_columns = [c for c in candles_df.columns if 'BB' in c.upper()]
@@ -823,8 +947,6 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             lines.extend([f"Market ID: {response.get('market_id', 'N/A')}"])
             lines.extend([f"Bias: {response.get('bias', 'N/A')}%"])
             lines.extend([f"Timestamp: {response.get('timestamp', 'N/A')}"])
-            if response.get('price_at_creation'):
-                lines.extend([f"Price at Creation: {response.get('price_at_creation')}"])
             if response.get('reason'):
                 lines.extend([f"Reason: {response.get('reason')}"])
             if response.get('message'):
@@ -836,11 +958,24 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         lines.extend([f"Traded Market IDs: {len(self._traded_market_ids)} ({', '.join(list(self._traded_market_ids)[:5])}{'...' if len(self._traded_market_ids) > 5 else ''})"])
         lines.extend([f"Poll Interval: {self.poll_interval}s"])
         
+        # Executor types summary (market_signal vs rsi_override)
+        market_signal_count = 0
+        rsi_override_count = 0
+        for executor in self.active_executors:
+            exec_market_id = self._executor_market_ids.get(executor.config.id, "")
+            if exec_market_id.startswith("rsi_"):
+                rsi_override_count += 1
+            else:
+                market_signal_count += 1
+        if market_signal_count > 0 or rsi_override_count > 0:
+            lines.extend([f"Active Executors: market_signal={market_signal_count}, rsi_override={rsi_override_count}"])
+        
         # Closed Executors
         if len(self.stored_executors) > 0:
             lines.extend(["\n################################## Closed Executors ##################################"])
             for executor in self.stored_executors:
-                lines.extend([f"|Signal id: {executor.config.timestamp}"])
+                market_id = self._executor_market_ids.get(executor.config.id, "N/A")
+                lines.extend([f"|Timestamp: {executor.config.timestamp} | Market id: {market_id}"])
                 lines.extend(executor.to_format_status())
                 lines.extend([
                     "-----------------------------------------------------------------------------------------------------------"])
@@ -849,7 +984,8 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         if len(self.active_executors) > 0:
             lines.extend(["\n################################## Active Executors ##################################"])
             for executor in self.active_executors:
-                lines.extend([f"|Signal id: {executor.config.timestamp}"])
+                market_id = self._executor_market_ids.get(executor.config.id, "N/A")
+                lines.extend([f"|Timestamp: {executor.config.timestamp} | Market id: {market_id}"])
                 lines.extend(executor.to_format_status())
         else:
             lines.extend(["\n################################## Active Executors ##################################"])
