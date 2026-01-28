@@ -32,7 +32,8 @@ class PerpsSignalStrategyConfig(BaseClientModel):
     margin_usd: Decimal = Field(default=Decimal("10"), gt=0, description="Margin amount in USD (position value = margin * leverage)")
     stop_loss: float = Field(default=0.03, gt=0, description="Static stop loss (used when stop_loss_natr_multiplier is 0)")
     stop_loss_natr_multiplier: float = Field(default=0.0, ge=0, description="Dynamic stop loss = NATR * multiplier. Set to 0 to use static stop_loss.")
-    take_profit: float = Field(default=0.01, gt=0)
+    take_profit: float = Field(default=0.01, gt=0, description="Static take profit (used when take_profit_natr_multiplier is 0)")
+    take_profit_natr_multiplier: float = Field(default=0.0, ge=0, description="Dynamic take profit = NATR * multiplier. Set to 0 to use static take_profit.")
     time_limit: int = Field(default=3600, gt=0)
     open_order_type: OrderType = Field(default=OrderType.MARKET)
     take_profit_order_type: OrderType = Field(default=OrderType.MARKET)
@@ -47,14 +48,13 @@ class PerpsSignalStrategyConfig(BaseClientModel):
     rsi_oversold: float = Field(default=30.0, ge=0, le=100, description="RSI oversold threshold (skip SHORT if RSI < this)")
     rsi_extreme_overbought: float = Field(default=85.0, ge=0, le=100, description="RSI extreme overbought threshold (skip LONG if RSI > this)")
     rsi_extreme_oversold: float = Field(default=15.0, ge=0, le=100, description="RSI extreme oversold threshold (skip SHORT if RSI < this)")
-    stoch_rsi_length: int = Field(default=5, ge=2, description="Stochastic RSI lookback period")
-    stoch_rsi_k: int = Field(default=2, ge=2, description="Stochastic RSI %K smoothing period (min 2)")
-    stoch_rsi_d: int = Field(default=2, ge=2, description="Stochastic RSI %D smoothing period (min 2)")
+    rsi_direction_threshold: float = Field(default=3.0, ge=0, description="RSI direction threshold - skip entry if RSI moved unfavorably by more than this (0 = disabled)")
     bb_length: int = Field(default=20, gt=0, description="Bollinger Bands period length")
     bb_std: float = Field(default=2.0, gt=0, description="Bollinger Bands standard deviation")
     bb_upper_threshold: float = Field(default=0.8, ge=0, le=1, description="BBP upper threshold (skip LONG if BBP > this)")
     bb_lower_threshold: float = Field(default=0.2, ge=0, le=1, description="BBP lower threshold (skip SHORT if BBP < this)")
     enable_rsi_override: bool = Field(default=False, description="If RSI contradicts signal, flip signal direction instead of skipping (e.g., SHORT signal + oversold RSI → trade LONG)")
+    contrarian_mode: bool = Field(default=False, description="Flip signal direction - LONG becomes SHORT, SHORT becomes LONG")
     candles_interval: str = Field(default="5m", description="Candles interval for technical indicators")
     candles_exchange: Optional[str] = Field(default=None, description="Exchange for candles (defaults to trading exchange)")
     small_loss_threshold: float = Field(default=-0.005, le=0, description="Keep unprofitable positions open if PNL > this threshold (e.g., -0.005 = -0.5%)")
@@ -111,6 +111,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         self.stop_loss = config.stop_loss
         self.stop_loss_natr_multiplier = config.stop_loss_natr_multiplier
         self.take_profit = config.take_profit
+        self.take_profit_natr_multiplier = config.take_profit_natr_multiplier
         self.time_limit = config.time_limit
         self.open_order_type = config.open_order_type
         self.take_profit_order_type = config.take_profit_order_type
@@ -125,14 +126,13 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
         self.rsi_oversold = config.rsi_oversold
         self.rsi_extreme_overbought = config.rsi_extreme_overbought
         self.rsi_extreme_oversold = config.rsi_extreme_oversold
-        self.stoch_rsi_length = config.stoch_rsi_length
-        self.stoch_rsi_k = config.stoch_rsi_k
-        self.stoch_rsi_d = config.stoch_rsi_d
+        self.rsi_direction_threshold = config.rsi_direction_threshold
         self.bb_length = config.bb_length
         self.bb_std = config.bb_std
         self.bb_upper_threshold = config.bb_upper_threshold
         self.bb_lower_threshold = config.bb_lower_threshold
         self.enable_rsi_override = config.enable_rsi_override
+        self.contrarian_mode = config.contrarian_mode
         self.candles_interval = config.candles_interval
         self.candles_exchange = config.candles_exchange or self.exchange
         # Volatility filter parameters
@@ -501,6 +501,10 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             signal = self._last_api_response.get('signal', 0)
             market_id = self._last_api_response.get('market_id')
             
+            # Contrarian mode: flip signal direction for all checks
+            if self.contrarian_mode and signal != 0:
+                signal = -signal
+            
             # Check for active positions
             active_executors = self.get_active_executors()
             
@@ -546,6 +550,24 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                         self.handle_profitable_position(executor, "signal flip")
                 # Don't clear tracked market_id or return - allow new positions if RSI extremes allow it
             
+            # Handle existing positions in opposite direction when signal is 1 or -1
+            # This runs BEFORE tech checks so positions are managed even if new entry is blocked
+            if signal != 0 and active_executors:
+                signal_side = TradeType.BUY if signal == 1 else TradeType.SELL
+                # Check all executors in opposite direction
+                opposite_executors = [
+                    executor for executor in active_executors
+                    if executor.config.side != signal_side
+                ]
+                for executor in opposite_executors:
+                    exec_market_id = self._executor_market_ids.get(executor.config.id, "N/A")
+                    is_rsi_exec = exec_market_id.startswith("rsi_") if exec_market_id != "N/A" else False
+                    exec_type = "RSI" if is_rsi_exec else "market"
+                    self.handle_profitable_position(
+                        executor, 
+                        f"opposite signal ({signal_side.name} vs {executor.config.side.name} {exec_type})"
+                    )
+            
             # Note: signal == 0 (no-trade) is handled in get_position_config() which checks RSI extremes
             # If RSI conditions aren't met, get_position_config() will return None
             
@@ -561,23 +583,6 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             
             executor_market_id = self._pending_market_id
             is_rsi_override = executor_market_id and executor_market_id.startswith("rsi_")
-            
-            # Close unprofitable RSI executors when valid opposite-direction market signal arrives
-            # Only for market signals (signal 1 or -1), not no-trade (0)
-            if not is_rsi_override and signal != 0 and active_executors:
-                new_side = position_config.side
-                unprofitable_opposite_rsi = [
-                    executor for executor in active_executors
-                    if (self._executor_market_ids.get(executor.config.id, "").startswith("rsi_")
-                        and executor.config.side != new_side
-                        and executor.trade_pnl_pct <= Decimal("0"))
-                ]
-                for executor in unprofitable_opposite_rsi:
-                    self.logger().info(
-                        f"Closing unprofitable RSI {executor.config.side.name} executor {executor.config.id} "
-                        f"(PNL: {executor.trade_pnl_pct:.4%}) - valid {new_side.name} market signal received"
-                    )
-                    self.handle_profitable_position(executor, f"opposite market signal ({new_side.name})")
             
             # Prevent multiple RSI override executors - only allow one at a time
             if is_rsi_override:
@@ -722,11 +727,6 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                 candles_df.ta.rsi(length=self.rsi_length, append=True)
                 rsi_column = f"RSI_{self.rsi_length}"
                 
-                # Calculate Stochastic RSI for momentum/direction detection
-                candles_df.ta.stochrsi(length=self.stoch_rsi_length, rsi_length=self.rsi_length, k=self.stoch_rsi_k, d=self.stoch_rsi_d, append=True)
-                stoch_k_column = f"STOCHRSIk_{self.stoch_rsi_length}_{self.rsi_length}_{self.stoch_rsi_k}_{self.stoch_rsi_d}"
-                stoch_d_column = f"STOCHRSId_{self.stoch_rsi_length}_{self.rsi_length}_{self.stoch_rsi_k}_{self.stoch_rsi_d}"
-                
                 # Calculate Bollinger Bands (using lower_std and upper_std like bollinger_v1.py)
                 candles_df.ta.bbands(length=self.bb_length, lower_std=self.bb_std, upper_std=self.bb_std, append=True)
                 
@@ -773,13 +773,13 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     rsi = last_candle[rsi_column]
                     bbp = last_candle["BBP"]
                     
-                    # Get Stochastic RSI for momentum/direction detection
-                    # %K > %D = bullish momentum (RSI rising), %K < %D = bearish momentum (RSI falling)
-                    stoch_k = last_candle.get(stoch_k_column, 50)
-                    stoch_d = last_candle.get(stoch_d_column, 50)
-                    rsi_rising = stoch_k > stoch_d
-                    rsi_falling = stoch_k < stoch_d
-                    stoch_info = f"StochRSI K={stoch_k:.1f} D={stoch_d:.1f}"
+                    # Get previous RSI for direction check (threshold-based)
+                    prev_candle = candles_df.iloc[-2] if len(candles_df) >= 2 else None
+                    prev_rsi = prev_candle[rsi_column] if prev_candle is not None else rsi
+                    rsi_change = rsi - prev_rsi
+                    # Only flag as significant if change exceeds threshold
+                    rsi_falling_significantly = rsi_change < -self.rsi_direction_threshold
+                    rsi_rising_significantly = rsi_change > self.rsi_direction_threshold
                     
                     # Get NATR for volatility filter and dynamic stop loss
                     natr_value = last_candle.get("NATR", None) if "NATR" in candles_df.columns else None
@@ -788,7 +788,7 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     if self.enable_volatility_filter and natr_value is not None:
                         if natr_value < self.min_volatility_pct:
                             self.logger().info(
-                                f"Skipping signal: NATR {natr_value:.3f}% < {self.min_volatility_pct}% (insufficient volatility, choppy market) RSI {rsi:.2f}, BBP {bbp:.3f}"
+                                f"Skipping signal: NATR {natr_value:.3f}% < {self.min_volatility_pct}% RSI {rsi:.2f}, BBP {bbp:.3f}"
                             )
                             return None
                     
@@ -798,8 +798,8 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                     # Handle no-trade signal: use RSI override if enabled
                     if signal == 0:
                         if self.enable_rsi_override:
-                            # RSI extremely oversold + BBP at lower band + RSI rising (bouncing) → LONG
-                            if rsi < self.rsi_extreme_oversold and bbp < self.bb_lower_threshold and rsi_rising:
+                            # RSI extremely oversold + BBP at lower band + not falling significantly → LONG
+                            if rsi < self.rsi_extreme_oversold and bbp < self.bb_lower_threshold and not rsi_falling_significantly:
                                 signal = 1
                                 # Use rsi_ prefixed market_id if available, otherwise generate one
                                 base_market_id = self._last_api_response.get('market_id') if self._last_api_response else None
@@ -810,10 +810,10 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                                     self._pending_market_id = f"rsi_{int(time.time())}"
                                 self.logger().info(
                                     f"RSI override (no-trade): RSI {rsi:.2f} < {self.rsi_extreme_oversold} (extremely oversold), "
-                                    f"{stoch_info} (rising), BBP {bbp:.3f} < {self.bb_lower_threshold}. Opening LONG."
+                                    f"change {rsi_change:+.1f}, BBP {bbp:.3f} < {self.bb_lower_threshold}. Opening LONG."
                                 )
-                            # RSI extremely overbought + BBP at upper band + RSI falling (reversing) → SHORT
-                            elif rsi > self.rsi_extreme_overbought and bbp > self.bb_upper_threshold and rsi_falling:
+                            # RSI extremely overbought + BBP at upper band + not rising significantly → SHORT
+                            elif rsi > self.rsi_extreme_overbought and bbp > self.bb_upper_threshold and not rsi_rising_significantly:
                                 signal = -1
                                 # Use rsi_ prefixed market_id if available, otherwise generate one
                                 base_market_id = self._last_api_response.get('market_id') if self._last_api_response else None
@@ -824,13 +824,12 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                                     self._pending_market_id = f"rsi_{int(time.time())}"
                                 self.logger().info(
                                     f"RSI override (no-trade): RSI {rsi:.2f} > {self.rsi_extreme_overbought} (extremely overbought), "
-                                    f"{stoch_info} (falling), BBP {bbp:.3f} > {self.bb_upper_threshold}. Opening SHORT."
+                                    f"change {rsi_change:+.1f}, BBP {bbp:.3f} > {self.bb_upper_threshold}. Opening SHORT."
                                 )
                             else:
-                                # No-trade signal and RSI/BBP don't meet criteria (including direction)
-                                direction_info = "rising" if rsi_rising else "falling" if rsi_falling else "flat"
+                                # No-trade signal and RSI/BBP don't meet criteria
                                 self.logger().info(
-                                    f"Skipping no-trade signal: RSI {rsi:.2f}, {stoch_info} ({direction_info}), BBP {bbp:.3f} - conditions not met"
+                                    f"Skipping no-trade signal: RSI {rsi:.2f} (change {rsi_change:+.1f}), BBP {bbp:.3f} - conditions not met"
                                 )
                                 return None
                         else:
@@ -839,6 +838,13 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                                 f"No-trade signal: RSI override disabled, skipping position"
                             )
                             return None
+                    
+                    # Contrarian mode: flip market signal BEFORE tech checks so we check correct direction
+                    # Only for market signals (not RSI override - check via _pending_market_id)
+                    is_rsi_signal = self._pending_market_id and self._pending_market_id.startswith("rsi_")
+                    if self.contrarian_mode and signal != 0 and not is_rsi_signal:
+                        signal = -signal
+                        self.logger().info(f"Contrarian mode: flipped to {'LONG' if signal == 1 else 'SHORT'}")
                     
                     # Normal RSI filtering for API signals (1 or -1) - no override, just skip if unfavorable
                     # Use regular market_id for market signals
@@ -849,26 +855,26 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
                         if rsi > self.rsi_overbought:
                             # Overbought: skip LONG
                             self.logger().info(
-                                f"Skipping LONG signal: RSI {rsi:.2f} > {self.rsi_overbought} (overbought), {stoch_info}"
+                                f"Skipping LONG signal: RSI {rsi:.2f} > {self.rsi_overbought} (overbought)"
                             )
                             return None
-                        if rsi_falling and rsi > self.rsi_oversold:
-                            # RSI momentum bearish: wait for stabilization before LONG
+                        if rsi_falling_significantly:
+                            # RSI dropped significantly: wait for stabilization before LONG
                             self.logger().info(
-                                f"Skipping LONG signal: RSI {rsi:.2f}, {stoch_info} (falling) - waiting for stabilization"
+                                f"Skipping LONG signal: RSI {rsi:.2f} dropped {abs(rsi_change):.1f} pts (>{self.rsi_direction_threshold}) - waiting for stabilization"
                             )
                             return None
                     elif signal == -1:
                         if rsi < self.rsi_oversold:
                             # Oversold: skip SHORT
                             self.logger().info(
-                                f"Skipping SHORT signal: RSI {rsi:.2f} < {self.rsi_oversold} (oversold), {stoch_info}"
+                                f"Skipping SHORT signal: RSI {rsi:.2f} < {self.rsi_oversold} (oversold)"
                             )
                             return None
-                        if rsi_rising and rsi < self.rsi_overbought:
-                            # RSI momentum bullish: wait for stabilization before SHORT
+                        if rsi_rising_significantly:
+                            # RSI rose significantly: wait for stabilization before SHORT
                             self.logger().info(
-                                f"Skipping SHORT signal: RSI {rsi:.2f}, {stoch_info} (rising) - waiting for stabilization"
+                                f"Skipping SHORT signal: RSI {rsi:.2f} rose {rsi_change:.1f} pts (>{self.rsi_direction_threshold}) - waiting for stabilization"
                             )
                             return None
                     
@@ -929,18 +935,35 @@ class PerpsSignalStrategy(DirectionalStrategyBase):
             # Calculate base amount: amount = position_value / price
             amount = position_value_usd / price
             
-            # Calculate dynamic stop loss if NATR multiplier is configured
-            if self.stop_loss_natr_multiplier > 0 and self._current_natr is not None:
-                # NATR is in percentage (e.g., 0.2 = 0.2%), convert to decimal for stop loss
-                dynamic_stop_loss = (self._current_natr / 100) * self.stop_loss_natr_multiplier
-                self.logger().info(
-                    f"Dynamic stop loss: NATR {self._current_natr:.3f}% × {self.stop_loss_natr_multiplier} = {dynamic_stop_loss:.4f} "
-                    f"({dynamic_stop_loss*100:.2f}%, {dynamic_stop_loss*self.leverage*100:.1f}% margin at {self.leverage}x)"
+            # Calculate dynamic stop loss and take profit if NATR multipliers are configured
+            use_dynamic = (self.stop_loss_natr_multiplier > 0 or self.take_profit_natr_multiplier > 0) and self._current_natr is not None
+            
+            if use_dynamic:
+                # NATR is in percentage (e.g., 0.2 = 0.2%), convert to decimal
+                natr_decimal = self._current_natr / 100
+                
+                # Dynamic stop loss
+                if self.stop_loss_natr_multiplier > 0:
+                    dynamic_stop_loss = natr_decimal * self.stop_loss_natr_multiplier
+                else:
+                    dynamic_stop_loss = self.stop_loss
+                
+                # Dynamic take profit
+                if self.take_profit_natr_multiplier > 0:
+                    dynamic_take_profit = natr_decimal * self.take_profit_natr_multiplier
+                else:
+                    dynamic_take_profit = self.take_profit
+                
+                # Log only at debug level to avoid spam
+                self.logger().debug(
+                    f"Dynamic barriers: NATR {self._current_natr:.3f}% → SL {dynamic_stop_loss:.4f} ({dynamic_stop_loss*self.leverage*100:.1f}% margin), "
+                    f"TP {dynamic_take_profit:.4f} ({dynamic_take_profit*self.leverage*100:.1f}% margin)"
                 )
-                # Create custom triple barrier config with dynamic stop loss
+                
+                # Create custom triple barrier config
                 triple_barrier = TripleBarrierConfig(
                     stop_loss=Decimal(str(dynamic_stop_loss)),
-                    take_profit=Decimal(str(self.take_profit)),
+                    take_profit=Decimal(str(dynamic_take_profit)),
                     time_limit=self.time_limit,
                     trailing_stop=TrailingStop(
                         activation_price=Decimal(str(self.trailing_stop_activation_delta)),
